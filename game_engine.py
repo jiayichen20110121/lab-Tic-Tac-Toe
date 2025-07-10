@@ -2,14 +2,15 @@
 
 import asyncio
 import argparse
+import json
 import redis.asyncio as aioredis
 from tic_tac_toe_board import TicTacToeBoard
 
-# Async Redis client + Pub/Sub channel
+# Async Redis + Pub/Sub setup
 REDIS_HOST = "ai.thewcl.com"
 REDIS_PORT = 6379
 REDIS_PASSWORD = "atmega328"
-pubsub_client = aioredis.Redis(
+redis_client = aioredis.Redis(
     host=REDIS_HOST,
     port=REDIS_PORT,
     password=REDIS_PASSWORD,
@@ -17,65 +18,68 @@ pubsub_client = aioredis.Redis(
 )
 CHANNEL = "ttt_game_state_changed:{game_id}"
 
-async def handle_board_state(game_id: str, player: str):
-    """Load board, prompt if it's your turn, make move + publish."""
+async def handle_state(game_id: str, player: str):
+    """Load state, display it, then if your turn prompt and publish."""
     board = TicTacToeBoard.load_from_redis(game_id)
-    print("\nCurrent board:")
-    board.print_board()
+
+    # 1) Show structured board JSON
+    print(json.dumps(board.to_dict(), indent=2))
     print("Status:", board.state)
 
+    # 2) If game over or not your turn, do nothing further
     if board.state != "is_playing":
-        return  # game over
-
+        return
     if not board.is_my_turn(player):
-        print("⏳ Waiting for opponent...")
+        print("⏳ Waiting for opponent…")
         return
 
+    # 3) It's your turn
     idx = input(f"{player}'s move (0-8): ").strip()
     if not idx.isdigit():
         print("Invalid input.")
         return
 
-    board.make_move(int(idx), player)
-    # Publish an update so the other subscriber wakes up:
-    await pubsub_client.publish(CHANNEL.format(game_id=game_id), "updated")
+    result = board.make_move(player, int(idx))
+    print(result["message"])
 
-async def listen_for_updates(game_id: str, player: str):
-    """Subscribe to the channel and react to updates."""
-    sub = pubsub_client.pubsub()
+    # 4) If move succeeded, notify opponent
+    if result["success"]:
+        await redis_client.publish(CHANNEL.format(game_id=game_id), "updated")
+
+async def listen_updates(game_id: str, player: str):
+    sub = redis_client.pubsub()
     await sub.subscribe(CHANNEL.format(game_id=game_id))
-    print(f"Subscribed to game {game_id!r} as player {player!r}.\n")
+    print(f"Subscribed as {player!r} to game {game_id!r}")
 
-    # Fire once immediately to show the initial state / maybe move
-    await handle_board_state(game_id, player)
+    # Initial fetch & possible move
+    await handle_state(game_id, player)
 
+    # React to pub/sub notifications
     async for msg in sub.listen():
         if msg["type"] == "message":
-            # Another player moved
-            await handle_board_state(game_id, player)
+            print("Update received")
+            await handle_state(game_id, player)
 
 async def main():
-    p = argparse.ArgumentParser()
-    p.add_argument("--game-id", required=True, help="Shared game ID")
-    p.add_argument("--player",  required=True, choices=["x","o"], help="Your symbol")
-    p.add_argument("--reset",   action="store_true", help="Reset board then exit")
-    args = p.parse_args()
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--game-id", required=True, help="Shared game ID")
+    parser.add_argument("--player",  required=True, choices=["x","o"], help="Your symbol")
+    parser.add_argument("--reset",   action="store_true", help="Reset board and exit")
+    args = parser.parse_args()
 
     if args.reset:
-        board = TicTacToeBoard(game_id=args.game_id)
-        board.reset()
-        print(f"Game {args.game_id!r} reset.")
+        res = TicTacToeBoard(game_id=args.game_id).reset()
+        print(res["message"])
         return
 
-    # Ensure there's a board in Redis
+    # Ensure there is a board in Redis
     try:
         TicTacToeBoard.load_from_redis(args.game_id)
     except ValueError:
-        print("No existing game; initializing a fresh board.")
         TicTacToeBoard(game_id=args.game_id).reset()
 
-    # Start Pub/Sub loop
-    await listen_for_updates(args.game_id, args.player)
+    # Start reactive loop
+    await listen_updates(args.game_id, args.player)
 
 if __name__ == "__main__":
     asyncio.run(main())
