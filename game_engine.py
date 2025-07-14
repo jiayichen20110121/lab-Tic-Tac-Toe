@@ -3,7 +3,7 @@
 import asyncio
 import argparse
 import json
-
+import websockets
 import httpx
 import redis.asyncio as aioredis
 
@@ -19,6 +19,8 @@ redis_client = aioredis.Redis(
     password=REDIS_PASSWORD,
     decode_responses=True
 )
+
+WEBSOCKET_URL = "ws://ai.thewcl.com:8709"
 
 # HTTP API base
 API_BASE_URL = "http://localhost:8000"
@@ -49,7 +51,7 @@ async def post_reset(game_id: str) -> dict:
         resp.raise_for_status()
         return resp.json()
 
-async def handle_state(game_id: str, player: str):
+async def handle_state(ws, game_id: str, player: str):
     # 1) Fetch current state
     state = await get_state(game_id)
     print(json.dumps(state, indent=2))
@@ -73,22 +75,26 @@ async def handle_state(game_id: str, player: str):
 
     # 4) On success, publish notification so opponent wakes up
     if result.get("success"):
+        await send_ws(ws, result)
         await redis_client.publish(CHANNEL.format(game_id=game_id), "updated")
 
-async def listen_updates(game_id: str, player: str):
+async def listen_updates(ws, game_id: str, player: str):
     pubsub = redis_client.pubsub()
     await pubsub.subscribe(CHANNEL.format(game_id=game_id))
     print(f"Subscribed as {player!r} to game {game_id!r}\n")
 
     # Initial display/prompt
-    await handle_state(game_id, player)
+    await handle_state(ws, game_id, player)
 
     # React to any pub/sub messages
     async for msg in pubsub.listen():
         if msg["type"] == "message":
             print("\nUpdate received")
-            await handle_state(game_id, player)
+            await handle_state(ws, game_id, player)
 
+async def send_ws(ws, msg):
+    await ws.send(json.dumps(msg))
+    
 async def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--game-id", required=True, help="Shared game ID")
@@ -107,9 +113,8 @@ async def main():
     except httpx.HTTPStatusError:
         result = await post_reset(args.game_id)
         print(result.get("message"))
-
-    # Enter Pub/Sub-driven loop
-    await listen_updates(args.game_id, args.player)
+    async with websockets.connect(WEBSOCKET_URL) as ws:
+        await listen_updates(ws, args.game_id, args.player)
 
 if __name__ == "__main__":
     asyncio.run(main())
